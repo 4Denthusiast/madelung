@@ -1,0 +1,4 @@
+.stack-work/
+madelung.cabal
+stack.yaml.lock
+*~
