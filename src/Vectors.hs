@@ -20,21 +20,24 @@ import Debug.Trace
 
 type Vect = [Double]
 
-dot :: Vect -> Vect -> Double
+dot :: Num n => [n] -> [n] -> n
 dot xs1 xs2 = sum $ zipWith (*) xs1 xs2
 
-isZero :: Vect -> Bool
+isZero :: (Num n,Eq n) => [n] -> Bool
 isZero = all (==0)
 
 norm :: Vect -> Double
 norm v = sqrt $ dot v v
 
-add :: Vect -> Vect -> Vect
+add :: Num n => [n] -> [n] -> [n]
 add = zipWith (+)
 
 -- The use of toRational is probably horribly inefficient, but this doesn't really need to be high performance.
-scale :: (Real a) => a -> Vect -> Vect
-scale s = map ((*) $ fromRational $ toRational s)
+scale :: Num n => n -> [n] -> [n]
+scale s = map (s*)
+
+scale' :: Num n => Integer -> [n] -> [n]
+scale' = scale . fromInteger
 
 type Lattice = [Vect]
 
@@ -45,7 +48,7 @@ dimension = length . head
 simplifyByLattice :: Lattice -> Vect -> Vect
 simplifyByLattice l v = foldr simplifyByVector v l
     where simplifyByVector lv v' | isZero lv = v'
-                                 | otherwise = add v' (scale (negate (round (dot lv v' / dot lv lv))) lv)
+                                 | otherwise = add v' (scale' (negate (round (dot lv v' / dot lv lv))) lv)
 
 -- A reasonably small (not necessarily minimal) equivalent representation of the same lattice.
 simplifyLattice :: Lattice -> Lattice
@@ -55,7 +58,7 @@ simplifyLattice l = if l' == l then l' else simplifyLattice l'
 
 -- All the lattice points within the given radius (hopefully).
 generateLattice :: Double -> Lattice -> Lattice
-generateLattice r l = filter (\v -> dot v v <= r * r) $ map (foldr1 add) $ sequence $ map (\v -> let r' = ceiling (r / norm v) in map (flip scale v) [-r'..r']) $ simplifyLattice $ l
+generateLattice r l = filter (\v -> dot v v <= r * r) $ map (foldr1 add) $ sequence $ map (\v -> let r' = ceiling (r / norm v) in map (flip scale' v) [-r'..r']) $ simplifyLattice $ l
 
 det :: [[Double]] -> Double
 det [] = 1
