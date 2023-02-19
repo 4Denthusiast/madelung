@@ -1,72 +1,50 @@
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 module Vectors (
-    Vect,
-    scale,
-    dot,
-    norm,
-    add,
-    isZero,
     Lattice,
-    dimension,
+    Dimension,
     simplifyLattice,
     generateLattice,
-    det,
     dual
 ) where
 
 import Data.List
+import GHC.TypeLits
+import qualified Numeric.LinearAlgebra.Data as VD
+import qualified Numeric.LinearAlgebra.Static as V
 import Util (nTimes)
 
 import Debug.Trace
 
-type Vect = [Double]
+-- The lattice vectors stored as columns
+type Lattice (n :: Nat) = V.L n n
 
-dot :: Num n => [n] -> [n] -> n
-dot xs1 xs2 = sum $ zipWith (*) xs1 xs2
+instance (KnownNat n, KnownNat m) => Eq (V.L n m) where
+    a == b = V.extract a == V.extract b
 
-isZero :: (Num n,Eq n) => [n] -> Bool
-isZero = all (==0)
+instance KnownNat n => Eq (V.R n) where
+    a == b = V.unwrap a == V.unwrap b
 
-norm :: Vect -> Double
-norm v = sqrt $ dot v v
-
-add :: Num n => [n] -> [n] -> [n]
-add = zipWith (+)
-
--- The use of toRational is probably horribly inefficient, but this doesn't really need to be high performance.
-scale :: Num n => n -> [n] -> [n]
-scale s = map (s*)
-
-scale' :: Num n => Integer -> [n] -> [n]
-scale' = scale . fromInteger
-
-type Lattice = [Vect]
-
-dimension :: Lattice -> Int
-dimension = length . head
+type Dimension n = (KnownNat n, KnownNat (n - 1), 1 <= n, ((n - 1) + 1) ~ n)
 
 -- A reasonably small (not necessarily minimal) vector that's the sum of the given vector with a lattive vector.
-simplifyByLattice :: Lattice -> Vect -> Vect
-simplifyByLattice l v = foldr simplifyByVector v l
-    where simplifyByVector lv v' | isZero lv = v'
-                                 | otherwise = add v' (scale' (negate (round (dot lv v' / dot lv lv))) lv)
+simplifyByLattice :: (KnownNat m, KnownNat n) => V.L m n -> V.L m 1 -> V.L m 1
+simplifyByLattice l v = v - V.mul l (V.dmmap roundDown (l V.<\> v))
+    where roundDown r = fromIntegral $ round (r - 0.1 * signum r) -- Bias it towards no change in cases of numerical noise
 
 -- A reasonably small (not necessarily minimal) equivalent representation of the same lattice.
-simplifyLattice :: Lattice -> Lattice
+simplifyLattice :: Dimension n => Lattice n -> Lattice n
 simplifyLattice l = if l' == l then l' else simplifyLattice l'
-    where l' = filter (not . isZero) $ nTimes (length l) simplifyFirst l
-          simplifyFirst (v : vs) = vs ++ [simplifyByLattice vs v]
+    where l' = nTimes (fromIntegral $ natVal l) simplifyFirst l
+          simplifyFirst vs = let (v,vs') = V.splitCols vs in (vs' V.||| simplifyByLattice vs' v)
 
 -- All the lattice points within the given radius (hopefully).
-generateLattice :: Double -> Lattice -> Lattice
-generateLattice r l = filter (\v -> dot v v <= r * r) $ map (foldr1 add) $ sequence $ map (\v -> let r' = ceiling (r / norm v) in map (flip scale' v) [-r'..r']) $ simplifyLattice $ l
+generateLattice :: Dimension n => Double -> Lattice n -> [V.R n]
+generateLattice r l = filter (\v -> V.dot v v <= r * r) $ map sum $ sequence $ map (\v -> let r' = fromIntegral $ ceiling (r / V.norm_2 v) in map ((v *) . V.konst) [-r'..r']) $ map (V.fromList . VD.toList) $ VD.toColumns $ V.extract $ simplifyLattice $ l
 
-det :: [[Double]] -> Double
-det [] = 1
-det vs = detWithPivot $ foldr findPivot (last vs,[],1) (init vs)
-    where findPivot v t@(p,vs,s) = if abs (head p) > abs (head v) then (p,v:vs,-s) else (v,p:vs,s)
-          detWithPivot (ph:pt,vs,s) | ph==0 = 0
-                                    | ph/=0 = s * ph * det (map (\(h:t) -> add t (scale (-h/ph) pt)) vs)
-
-dual :: Lattice -> Lattice
-dual l = map (zipWith (*) (cycle [1,-1])) $ zipWith scale (cycle [1/det l,-1/det l]) $ map (map det . semiminors . transpose) $ semiminors l
-    where semiminors x = zipWith (++) (inits x) (tail $ tails x)
+dual :: KnownNat n => Lattice n -> Lattice n
+dual = V.tr . V.inv

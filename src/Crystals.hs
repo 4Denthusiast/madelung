@@ -1,4 +1,7 @@
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Crystals (
 ) where
@@ -6,61 +9,67 @@ module Crystals (
 import Vectors
 
 import Debug.Trace
+import GHC.TypeLits
+import qualified Numeric.LinearAlgebra.Static as V
 import Numeric.SpecFunctions (erfc)
 
-cubicLattice :: Int -> Lattice
-cubicLattice n = map (\i -> replicate i 0 ++ [1] ++ replicate (n-i-1) 0) [0..(n-1)]
+cubicLattice :: KnownNat n => Lattice n
+cubicLattice = l --This should just be V.eye, but that function is very buggy.
+    where l = V.matrix $ concatMap (\i -> replicate i 0 ++ [1] ++ replicate (n-i-1) 0) [0..(n-1)]
+          n = fromIntegral $ natVal l
 
-bccLattice :: Int -> Lattice
-bccLattice n = replicate n 0.5 : tail (cubicLattice n)
+bccLattice :: Dimension n => Lattice n
+bccLattice = (cubicLattice V.=== V.row 0) V.||| V.col 0.5
 
-fccLattice :: Int -> Lattice
-fccLattice n = (1:(-1):replicate (n-2) 0) : map (1:) (cubicLattice (n-1))
+fccLattice :: Dimension n => Lattice n
+fccLattice = l
+    where l = (cubicLattice V.||| V.col (V.vector (-1:replicate (fromIntegral (natVal l)-2) 0))) V.=== V.row 1
 
 -- Includes a simplex of the full dimension. Equivalent to fcc in 3D.
-simplexLattice :: Int -> Lattice
-simplexLattice n = map (\i -> replicate i x ++ [x'] ++ replicate (n-i-1) x) [0..(n-1)]
-    where x = (sqrt (fromIntegral (1+n)) - 1) / (sqrt 2 * fromIntegral n)
-          x' = x + sqrt 0.5
+simplexLattice :: Dimension n => Lattice n
+simplexLattice = l
+    where l = V.konst (sqrt 0.5) * cubicLattice + V.konst x
+          x = (sqrt (fromIntegral (1+n)) - 1) / (sqrt 2 * fromIntegral n)
+          n = fromIntegral $ natVal l
 
-data Crystal = Crystal Lattice [(Double, Vect)] deriving Show
+data Crystal n = Crystal (Lattice n) [(Double, V.R n)] deriving Show
 
-nacl :: Int -> Crystal
-nacl n = Crystal (fccLattice n) [(1,replicate n 0),(-1,1:replicate (n-1) 0)]
+nacl :: Dimension n => Crystal n
+nacl = Crystal fccLattice [(1,0),(-1,0 V.& 1)]
 
-cscl :: Int -> Crystal
-cscl n = Crystal (cubicLattice n) [(1,replicate n 0),(-1,replicate n 0.5)]
+cscl :: Dimension n => Crystal n
+cscl = Crystal cubicLattice [(1,0),(-1,0.5)]
 
-zincblende :: Int -> Crystal
-zincblende n = Crystal l [(1,replicate n 0),(-1,replicate n y)]
-    where l = simplexLattice n
-          y = 1/(2*sum (head l)) --equidistant from 0 and all the basis vectors
+zincblende :: Dimension n => Crystal n
+zincblende = Crystal l [(1,0),(-1,V.konst y)]
+    where l = simplexLattice
+          y = 1/(2*V.dot 1 (V.uncol $ fst $ V.splitCols l)) --equidistant from 0 and all the basis vectors
 
-jellium :: Lattice -> Crystal
-jellium l = Crystal l [(1,scale 0 (head l))]
+jellium :: Lattice n -> Crystal n
+jellium l = Crystal l [(1,0)]
 
 -- The energy of the unit cell in the total field (without particles self-interacting)
-totalEnergy :: Crystal -> Double
-totalEnergy c@(Crystal l as) = energyWithCutoff c (det l ** (1/fromIntegral (length (head l))))
+totalEnergy :: Dimension n => Crystal n -> Double
+totalEnergy c@(Crystal l as) = energyWithCutoff c (abs(V.det l) ** (1/fromIntegral (natVal l)))
 
-energyWithCutoff :: Crystal -> Double -> Double
+energyWithCutoff :: Dimension n => Crystal n -> Double -> Double
 energyWithCutoff c a = shortRangeEnergy c a + longRangeEnergy c a
 
 -- The energy of the unit cell in the convolution of the field with a^-d exp(-pi r^2/a^2), including self-interaction, calculated in reciprocal space.
-longRangeEnergy :: Crystal -> Double -> Double
-longRangeEnergy (Crystal l as) a = sumOver baseField \(v,s) -> s * ((sumOver as \(q,v') -> q*cos(2*pi*dot v v'))^2 + (sumOver as \(q,v') -> q*sin(2*pi*dot v v'))^2)
+longRangeEnergy :: Dimension n => Crystal n -> Double -> Double
+longRangeEnergy (Crystal l as) a = sumOver baseField \(v,s) -> s * ((sumOver as \(q,v') -> q*cos(2*pi*V.dot v v'))^2 + (sumOver as \(q,v') -> q*sin(2*pi*V.dot v v'))^2)
     where d :: Num n => n
-          d = fromIntegral $ dimension l
+          d = fromIntegral $ natVal l
           -- The field, in reciprocal space, of a lattice l of gaussians with a compensatory uniform background.
-          baseField = map (\v -> (v,(d-2)*sphereArea d/(4*pi*pi)/(dot v v)*exp(-pi*a*a*dot v v)/abs(det l))) $ filter (not . isZero) $ generateLattice (3/a) $ dual l
+          baseField = map (\v -> (v,(d-2)*sphereArea d/(4*pi*pi)/(V.dot v v)*exp(-pi*a*a*V.dot v v)/abs(V.det l))) $ filter ((/= 0).V.norm_1) $ generateLattice (3/a) $ dual l
 
 -- The energy of the unit cell in the total field minus the long range energy.
-shortRangeEnergy :: Crystal -> Double -> Double
-shortRangeEnergy (Crystal l as) a = backgroundTerm + sumOver (generateLattice (4*a) l) \v -> sumOver as \(q0,v0) -> sumOver as \(q1,v1) -> q0*q1*potential (dimension l) (norm (add v (add v0 (scale (-1) v1))))
+shortRangeEnergy :: Dimension n => Crystal n -> Double -> Double
+shortRangeEnergy (Crystal l as) a = backgroundTerm + sumOver (generateLattice (4*a) l) \v -> sumOver as \(q0,v0) -> sumOver as \(q1,v1) -> q0*q1*potential (fromIntegral $ natVal l) (V.norm_2 (v + v0 - v1))
     where potential d 0 = - sphereArea d * a^^(2-d) / (2*pi) -- Self interaction is ignored but it's included in the long-range, so it still needs to be cancelled.
           potential 3 r = erfc(r*sqrt pi/a)/r
           potential 4 r = exp(-pi*r*r/(a*a)) / (r*r)
-          backgroundTerm = -(sumOver as fst)^2 * case (dimension l) of {3 -> a^2; 4 -> pi*a^2} / abs (det l)
+          backgroundTerm = -(sumOver as fst)^2 * case (natVal l) of {3 -> a^2; 4 -> pi*a^2} / abs (V.det l)
 
 -- The surface area of a unit sphere in d-dimensional space i.e. S^(d-1)
 sphereArea :: Int -> Double
@@ -71,13 +80,13 @@ sphereArea d = (2*pi)^(div d 2)*2^(mod d 2) / doubleFac (d-2)
 sumOver :: Num n => [a] -> (a -> n) -> n
 sumOver xs f = sum $ map f xs
 
-minSeparation :: Crystal -> Double
-minSeparation (Crystal l as) = minimum $ map norm $ filter (not . isZero) $ add <$> aos <*> generateLattice ((2*) $ maximum $ map norm (aos ++ l)) l
+minSeparation :: Dimension n => Crystal n -> Double
+minSeparation (Crystal l as) = minimum $ filter (/=0) $ map V.norm_2 $ (+) <$> aos <*> generateLattice ((2*) $ maximum $ V.norm_2 l : map V.norm_2 aos) l
     where aps = map snd as
-          aos = (add . scale (-1)) <$> aps <*> aps
+          aos = (-) <$> aps <*> aps
 
-madelungsConstant :: Crystal -> Double
-madelungsConstant c@(Crystal l _) = totalEnergy c * minSeparation c ^(dimension l-2)
+madelungsConstant :: Dimension n => Crystal n -> Double
+madelungsConstant c@(Crystal l _) = totalEnergy c * minSeparation c ^(fromIntegral (natVal l)-2)
 
-benchmark :: Int -> [Double]
-benchmark d = map madelungsConstant $ [nacl d, cscl d, zincblende d] ++ map jellium [cubicLattice d, bccLattice d, fccLattice d, simplexLattice d]
+benchmark :: forall proxy n. Dimension n => proxy n -> [Double]
+benchmark d = map madelungsConstant $ ([nacl, cscl, zincblende] ++ map jellium [cubicLattice, bccLattice, fccLattice, simplexLattice] :: [Crystal n])
