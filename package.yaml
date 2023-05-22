@@ -24,8 +24,10 @@ dependencies:
 library:
   source-dirs: src
   dependencies:
+    - containers
     - ghc
     - math-functions
+    - transformers
 
 executables:
   madelung-exe:

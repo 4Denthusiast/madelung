@@ -1,13 +1,18 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 module Symmetry (
 ) where
 
+import Control.Monad.Trans.State
 import Data.Complex
 import Data.Function
 import Data.List
+import Data.Maybe
 import Data.Ord
 import Data.Ratio
+import qualified Data.Set as S
+import Data.Set (Set, member, notMember, singleton, empty, size)
 import Debug.Trace
 import qualified Numeric.LinearAlgebra as V
 import Util (nTimes)
@@ -86,56 +91,90 @@ representativePointSymmetries d = foldr (filter . betterThanConjugate) (basicPoi
     where betterThanConjugate (p,p') m = let c = p' <> m <> p in not (generateable c) || m <= c
 
 -- The first argument is the generators of the group. The second is all the elements of the group. The third represents the restrictions on the lattice shape in some way I haven't entirely worked out yet.
-data PointGroup = PG [IntMat] [IntMat] (V.Matrix Double)
+data PointGroup = PG [IntMat] (Set IntMat) (V.Matrix Double) deriving (Show)
 
 -- May include some groups that are conjugate to each other.
 allPointGroups :: Int -> [PointGroup]
-allPointGroups d = removeExactDuplicates $ concatMap expand $ initialGroups
-    where initialGroups = map (\s -> (PG [s] (addGroupElement [V.ident d] s) (normRestrictions s), map (\m -> (m,normRestrictions m)) (basicPointSymmetries d))) (representativePointSymmetries d)
-          expand = expandTrimmed . trimRemainingSymmetries
-          trimRemainingSymmetries (PG gens g rs, ss) = (PG gens g rs, filter (\(s,sn) -> head gens <= s && not (elem s g) && normValid d (V.orth (rs V.||| sn))) ss)
-          expandTrimmed (g, ss) = g : concatMap (expandWith g ss) ss
-          expandWith (PG gens g rs) ss (s,sn) = expand $ (PG (s:gens) (addGroupElement g s) (V.orth (rs V.||| sn)), ss)
-          addGroupElement g e = addGroupElement' (e:g) g []
-          addGroupElement' :: [IntMat] -> [IntMat] -> [IntMat] -> [IntMat]
-          addGroupElement' gens new old = if new == [] then old else addGroupElement' gens (filter (flip notElem (new ++ old)) ((<>) <$> new <*> gens)) (new ++ old)
-          removeExactDuplicates = map (snd . head) . groupBy (\(x,_) (y,_) -> x==y) . sortOn fst . map (\pg@(PG _ g _) -> (sort g, pg))
+allPointGroups d = snd $ execState (mapM_ expand initialGroups) (empty,[])
+    where initialGroups = zipWith (\n s -> (n,PG [s] (addGroupElement (singleton $ V.ident d) s) (normRestrictions s), map (\m -> (m,normRestrictions m)) (basicPointSymmetries d))) [0..] (representativePointSymmetries d)
+          expand (n,pg@(PG gens g rs), ss) = do
+              (gs,gl) <- get
+              if member g gs then
+                  trace (show n ++ map (const ' ') gens ++ show (size g, size gs)) $ return ()
+              else trace (show n ++ map (const '-') gens ++ show (size g, length ss)) $ do
+                  let ss' = trimRemainingSymmetries gens g rs ss
+                  put (S.insert g gs, pg : gl)
+                  mapM_ (expandWith n pg ss') ss'
+          trimRemainingSymmetries gens g rs ss = filter (\(s,sn) -> head gens < s && notMember s g && normValid d (orth (rs V.||| sn)) && all (<=s) (filter (flip member $ S.fromList $ map fst ss) $ (s<>) <$> S.toList g)) ss
+          expandWith n (PG gens g rs) ss (s,sn) = expand (n, PG (s:gens) (addGroupElement g s) (orth (rs V.||| sn)), ss)
+          addGroupElement g e = addGroupElement' (e:S.toList g) g empty
+          addGroupElement' :: [IntMat] -> Set IntMat -> Set IntMat -> Set IntMat
+          addGroupElement' gens new old = if S.null new then old else addGroupElement' gens (S.difference (S.fromList $ (<>) <$> S.toList new <*> gens) (S.union new old)) (S.union new old)
+          orth m = if V.cols m == 0 then m else V.orth m
 
--- Considering the norm as a d(d+1)/2 dimensional vector (e1.e1, e2.e2, ..., ed.ed, e1.e2, e2.e3, ..., e1.ed) the transform m preserving the norm is equivalent to every column of (normRestrictions m) being perpendicular to it. Ideally I'd keep it as ints to avoid rounding errors given I'll need equality comparisons using the result, but the algorithm to compute the range of an int matrix is more complicated and not in the library.
+-- Considering the norm as a d^2 dimensional vector, the transform m preserving the norm is equivalent to every column of (normRestrictions m) being perpendicular to it. Ideally I'd keep it as ints to avoid rounding errors given I'll need equality comparisons using the result, but the algorithm to compute the range of an int matrix is more complicated and not in the library.
 normRestrictions :: IntMat -> V.Matrix Double
 normRestrictions m = V.orth $ V.fromLists elements
-    where elements = map (\i -> map (element i) (triangleIndices (V.rows m))) (triangleIndices (V.rows m))
-          element (qx,qy) (ix,iy) = fromIntegral $ (if (ix,iy)==(qx,qy) then -1 else 0) + V.atIndex m (qx,ix) * V.atIndex m (qy,iy) + (if qx /= qy then V.atIndex m (qy,ix) * V.atIndex m (qx,iy) else 0)
-
-triangleIndices d = [(x,y) | x <- [0..d-1], y <- [0..x]]
+    where elements = map (\i -> map (element i) (filter (uncurry (>=)) indices)) indices
+          element (qx,qy) (ix,iy) = (halfElement (qx,qy) (ix,iy) + halfElement (qy,qx) (ix,iy)) / 2
+          halfElement (qx,qy) (ix,iy) = fromIntegral $ (if (ix,iy)==(qx,qy) then -1 else 0) + V.atIndex m (qx,ix) * V.atIndex m (qy,iy)
+          indices = [(x,y) | y <- [0..V.rows m - 1], x <- [0..V.rows m - 1]]
 
 -- Is there a positive definite norm which satisfies these restrictions? I don't have a proof that the method I'm using is correct but it seems plausible. It searches iteratively for a matrix which is the outer product of a vector with itself and is in the span of the argument by repeatedly approximating the matrix with a single square by taking the square of the eigenvector corresponding to the greatest eigenvalue then projecting that onto the span of the argument. Because of the iteration this is terribly inefficient.
 normValid :: Int -> V.Matrix Double -> Bool
-normValid d rs = trace "------" $ V.cols rs == 0 || getsStuck (-1) (head $ V.toColumns $ traceShowId rs)
-    where epsilon = 1e-2
-          getsStuck pl v = traceShow v $ let
-                  v' = traceShowId $ project $ traceShowId $ V.normalize $ traceShowId $ flattenSymMatrix $ traceShowId $ positiveEigenvectors $ traceShowId $ toSymmMatrix v
-                  l = traceShowId $ V.norm_2 v'
-                  v'' = V.scale (1/l) v'
-              in (l >= 0) && not (l > 1-epsilon) && (abs (l-pl) < epsilon*epsilon || getsStuck l v'')
-          toSymmMatrix v = V.trustSym $ (d V.>< d) [v V.! reverseIndex (max x y) (min x y) | x <- [0..d-1], y <- [0..d-1]]
-          reverseIndex x y = div (x*(x+1)) 2 + y
-          positiveEigenvectors = (\(xs,vs) -> vs <> V.diag (V.cmap (max 0) xs) <> V.tr vs) . V.eigSH
-          --sqrtDiag = V.cmap (sqrt . abs) . V.takeDiag
-          --outerSquare = (\x -> x <> V.tr x)
-          flattenSymMatrix :: V.Matrix Double -> V.Vector Double
-          flattenSymMatrix m = V.fromList $ map (V.atIndex m) (triangleIndices d)
+normValid d rs = checkInterleaved (findNorm $ V.flatten $ V.ident d) (findObstruction $ head $ V.toColumns $ traceShowId rs)
+    where {-checkInterleaved (True:_) _ = True
+          checkInterleaved (False:_) (True:_) = False
+          checkInterleaved (False:x) (False:y) = checkInterleaved x y-}
+          checkInterleaved xs _ = any id $ take 4 xs
+          
+          findObstruction v = traceShow prettyRS $ let
+                  v' = traceShowId $ V.flatten $ traceShowId $ positiveEigenvectors $ traceShowId $ toSymmMatrix v
+                  e = traceShowId $ V.norm_2 (v' - v)
+                  d = traceShowId $ V.norm_2 $ traceShowId $ project (v' - v)
+                  v'' = traceShowId $ V.normalize $ traceShowId $ project $ traceShowId $ v + V.scale ((e/d)^2) (v' - v)
+              in seq v'' $ (e < 1e-6) : findObstruction v''
+          prettyRS = map (V.reshape d) $ V.toColumns $ V.cmap (\x -> if abs x < 1e-14 then 0 else x) $ prettify rs
+          toSymmMatrix = V.trustSym . V.reshape d
+          positiveEigenvectors = (\v -> v <> V.tr v) . (V.?? (V.All, V.Take 1)) . snd . V.eigSH
           project = (rs V.#>) . (V.<# rs)
+          
+          findNorm v = let
+                  (xs,vs) = V.eigSH $ toSymmMatrix $ v - project v
+                  v' = V.normalize $ V.flatten $ vs <> V.diag (V.cmap (max (0.5/fromIntegral d)) xs) <> V.tr vs
+              in (all (> 0.2/fromIntegral d) $ V.toList xs) : findNorm v'
 
+-- Note! This does not check that the matrices are the same size. Doing that makes it run noticably slower.
 instance Ord (V.Matrix V.I) where
-    compare m1 m2 = compare (V.toLists m1) (V.toLists m2)
+    compare m1 m2 = compare (V.flatten m1) (V.flatten m2)
 
---For debugging purposes.
+pointGroups :: Int -> [PointGroup]
+pointGroups d = concatMap (nubBy equivalent . map snd) $ groupBy (on (==) fst) $ sortOn fst $ map (\p@(PG _ g _) -> ((groupSignature g, messiness g), p)) $ allPointGroups d
+    where groupSignature = counts . map subCycleSignature . S.toList
+          messiness = sum . map (V.sumElements . V.cmap abs) . S.toList
+          -- equivalent actually checks the first is conjugate to a subgroup of the second, as it is assumed the groups are the same size.
+          equivalent (PG gens _ _) (PG _ g _) = any (\(s',s) -> all (\gen -> member (s' <> gen <> s) g) gens) symmetriesAndInverses
+          symmetriesAndInverses = mapMaybe (\s -> (, s) <$> inv s) $ map toIntMat $ allPointSymmetries d
+          inv s = inv' s s
+          inv' ss s
+              | s <> ss == V.ident d  = Just ss
+              | not (generateable ss) = Nothing
+              | otherwise             = inv' (ss <> s) s
+
+--For debugging purposes. The criterion (>10) is not principled.
 order :: IntMat -> Int
 order m = order' m  1
     where order' mm n | mm == i                             = n
-                      | not $ null $ V.find ((>1) . abs) mm = 0
+                      | not $ null $ V.find ((>10) . abs) mm = 0
                       | otherwise                           = order' (mm <> m) (n+1)
+          i = V.ident (V.rows m)
+
+--The group element order, except when the orbit goes outside the range of allowed matrices it counts as 0 even if it would come back again.
+strictOrder :: IntMat -> Int
+strictOrder m = order' m 1
+    where order' mm n | mm == i               = n
+                      | not (generateable mm) = 0
+                      | otherwise             = order' (mm <> m) (n+1)
           i = V.ident (V.rows m)
 
 subCycleSignature :: IntMat -> [Int]
@@ -146,9 +185,30 @@ subCycleSignature = reverse . sort . map cOrder . V.toList . fst . V.eig . (V.fr
                          | magnitude xx > 2 || magnitude xx < 0.5 = 0
                          | otherwise = cOrder' x (x*xx) (n+1)
 
+groupSignature :: PointGroup -> [([Int],Int)]
+groupSignature (PG _ g _) = counts $ map subCycleSignature $ S.toList g
+
 counts :: forall a. Ord a => [a] -> [(a,Int)]
 counts = sort . foldr insert []
     where insert :: a -> [(a,Int)] -> [(a,Int)]
           insert x cs = case lookup x cs of
             Nothing -> (x,1):cs
             Just n -> (x,n+1):filter (/=(x,n)) cs
+
+-- A sparser matrix with the same range.
+prettify :: V.Matrix Double -> V.Matrix Double
+prettify = V.fromColumns . map (V.cmap roundClose . rescale) . prettify' . V.toColumns
+    where prettify' = prettify'' 0 0 . map (V.cmap (\x -> if abs x > epsilon then x else 0))
+          prettify'' x y vs
+              | x >= length vs = vs
+              | y >= length vs = prettify'' (x+1) 0 vs
+              | x == y = prettify'' x (y+1) vs
+              | subset (vs !! x) (vs !! y) = traceShow (x,y) $ prettify' $ sparsen (vs !! x) (vs !! y) : (take y vs ++ drop (y+1) vs)
+              | otherwise = prettify'' x (y+1) vs
+          subset x y = all id $ zipWith (<=) (map (/=0) $ V.toList x) (map (/=0) $ V.toList y)
+          sparsen :: V.Vector Double -> V.Vector Double -> V.Vector Double
+          sparsen x y = let pivot = head $ traceShowId $ (\ps -> filter ((>maximum (map abs ps)*0.1).abs) ps) $ traceShowId $ filter ((>0).abs) $ traceShowId $ zipWith (/) (V.toList x) (V.toList y) in if pivot /= pivot then error (show (x,y)) else y - V.scale (1/pivot) x
+          rescale :: V.Vector Double -> V.Vector Double
+          rescale v = V.scale (1/maximumBy (comparing abs) (V.toList v)) v
+          roundClose x = if abs (fromIntegral (round (x*100)) - x*100) > epsilon*100 then x else fromIntegral (round (x*100))/100
+          epsilon = 1e-14
